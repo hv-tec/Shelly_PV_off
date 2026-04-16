@@ -1,4 +1,4 @@
 # Shelly_PV_off
-NP negatiivne hind peatab PV inverteri tootmise
+NordPool negatiivne hind peatab PV inverteri tootmise Shelly relee abil
 Telefonile saadetakse sõnum Pushover kaudu statuse muutuse ja NP hinna kohta
 
