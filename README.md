@@ -1,3 +1,107 @@
 # Shelly_PV_off
-NP negatiivne hind peatab PV inverteri tootmise
-Telefonile saadetakse sõnum Pushover kaudu statuse muutuse ja NP hinna kohta
+# NP negatiivne hind peatab PV inverteri tootmise
+# Telefonile saadetakse sõnum Pushover kaudu statuse muutuse ja NP hinna kohta
+# Autor Heikki Visnapuu
+
+let CFG = {
+  relay_id: 0,
+  threshold_eur_mwh: 0,
+  check_interval: 120,
+  api_timeout: 15,
+  pushover_token: "????",   // ← Pushover app token
+  pushover_user:  "????",    // ← Pushover user key
+};
+
+let state = { relay_on: false, last_price: null };
+
+function sendPushover(title, message) {
+  let body = "token=" + CFG.pushover_token
+           + "&user="    + CFG.pushover_user
+           + "&title="   + title
+           + "&message=" + message
+           + "&priority=1";  // 1 = kõrge prioriteet, heliseb kohe
+
+  Shelly.call("HTTP.POST", {
+    url: "https://api.pushover.net/1/messages.json",
+    content_type: "application/x-www-form-urlencoded",
+    body: body,
+    timeout: CFG.api_timeout
+  }, function(res, err) {
+    if (err) { print("Pushover viga:", err); return; }
+    print("Pushover saadetud, vastus:", res.code);
+  });
+}
+
+function setRelay(on, price) {
+  if (state.relay_on === on) return;
+  Shelly.call("Switch.Set", { id: CFG.relay_id, on: on }, function(r, e) {
+    if (e) { print("Relay viga:", e); return; }
+    state.relay_on = on;
+    if (on) {
+      print(">>> RELAY ON – PV Off (" + price + " EUR/MWh)");
+      sendPushover(
+        "Ula PV – tootmine peatatud",
+        "Hind " + price + " EUR/MWh (alla " + CFG.threshold_eur_mwh + ")\nRelee On – inverter Off"
+      );
+    } else {
+      print("<<< RELAY OFF – PV On (" + price + " EUR/MWh)");
+      sendPushover(
+        "Ula PV – tootmine On",
+        "Hind " + price + " EUR/MWh (ule " + CFG.threshold_eur_mwh + ")\nRelee Off – inverter On"
+      );
+    }
+  });
+}
+
+function checkPrice() {
+  let now = Date.now();
+  let periodStart = Math.floor(now / 900000) * 900000;
+  let periodEnd   = periodStart + 900000;
+
+  function toISO(ms) {
+    return new Date(ms).toISOString().split(".")[0] + "Z";
+  }
+
+  let url = "https://dashboard.elering.ee/api/nps/price"
+          + "?fields=ee"
+          + "&start=" + toISO(periodStart)
+          + "&end="   + toISO(periodEnd);
+
+  Shelly.call("HTTP.GET", { url: url, timeout: CFG.api_timeout }, function(res, err) {
+    if (err || !res || res.code !== 200) {
+      print("API viga:", err || (res ? res.code : "no response"));
+      return;
+    }
+    try {
+      let data = JSON.parse(res.body);
+      if (!data.success || !data.data || !data.data.ee || !data.data.ee.length) {
+        print("Tühi vastus Elering API-st");
+        return;
+      }
+      let price = data.data.ee[0].price;
+      state.last_price = price;
+      print("Nord Pool EE hind:", price, "EUR/MWh");
+
+      if (price < CFG.threshold_eur_mwh) {
+        setRelay(true, price);
+      } else {
+        setRelay(false, price);
+      }
+    } catch(e) {
+      print("JSON viga:", e);
+    }
+  });
+}
+
+checkPrice();
+Timer.set(CFG.check_interval * 1000, true, checkPrice);
+print("Skript käivitatud. Threshold:", CFG.threshold_eur_mwh, "EUR/MWh");
+
+Shelly.addStatusHandler(function(e) {
+  if (e.component === "switch:0" && e.delta && e.delta.output !== undefined) {
+    sendPushover(
+      "Manual ",
+      "Relee " + (e.delta.output ? "ON" : "OFF")
+    );
+  }
+});
