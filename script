@@ -1,12 +1,21 @@
-# Autor Heikki Visnapuu
+/*
+Created by Heikki Visnapuu, 2026
+Licensed under the MIT License
+https://github.com/hv-tec/Shelly_PV_off
+
+This Shelly script is designed to retrieve 15 min energy market prices from Elering and
+activate shelly NO relay to cut off solar panels production.
+*/
 
 let CFG = {
   relay_id: 0,
   threshold_eur_mwh: 0,
   check_interval: 120,
   api_timeout: 15,
-  pushover_token: "????",   // ← Pushover app token
-  pushover_user:  "????",    // ← Pushover user key
+  tasakaalustus_eur_mwh: 0,  // tasakaalustusteenus 3.73 s/kWh × 10
+  marginaal_eur_mwh: 15.0,       // Alexela vm müügimarginaal
+  pushover_token: "????",        // ← Pushover app token
+  pushover_user:  "????",        // ← Pushover user key
 };
 
 let state = { relay_on: false, last_price: null };
@@ -16,8 +25,7 @@ function sendPushover(title, message) {
            + "&user="    + CFG.pushover_user
            + "&title="   + title
            + "&message=" + message
-           + "&priority=1";  // 1 = kõrge prioriteet, heliseb kohe
-
+           + "&priority=1";
   Shelly.call("HTTP.POST", {
     url: "https://api.pushover.net/1/messages.json",
     content_type: "application/x-www-form-urlencoded",
@@ -29,23 +37,21 @@ function sendPushover(title, message) {
   });
 }
 
-function setRelay(on, price) {
+function setRelay(on, np_price, eff_price) {
   if (state.relay_on === on) return;
   Shelly.call("Switch.Set", { id: CFG.relay_id, on: on }, function(r, e) {
     if (e) { print("Relay viga:", e); return; }
     state.relay_on = on;
+    let msg = "NP: " + np_price + " EUR/MWh\n"
+            + "Tasakaalustus: -" + CFG.tasakaalustus_eur_mwh + "\n"
+            + "Marginaal: -" + CFG.marginaal_eur_mwh + "\n"
+            + "Efektiivne: " + eff_price + " EUR/MWh";
     if (on) {
-      print(">>> RELAY ON – PV Off (" + price + " EUR/MWh)");
-      sendPushover(
-        "Ula PV – tootmine peatatud",
-        "Hind " + price + " EUR/MWh (alla " + CFG.threshold_eur_mwh + ")\nRelee On – inverter Off"
-      );
+      print(">>> RELAY ON – PV Off (" + eff_price + " EUR/MWh)");
+      sendPushover("Ula PV – tootmine peatatud", msg + "\nRelee On – inverter Off");
     } else {
-      print("<<< RELAY OFF – PV On (" + price + " EUR/MWh)");
-      sendPushover(
-        "Ula PV – tootmine On",
-        "Hind " + price + " EUR/MWh (ule " + CFG.threshold_eur_mwh + ")\nRelee Off – inverter On"
-      );
+      print("<<< RELAY OFF – PV On (" + eff_price + " EUR/MWh)");
+      sendPushover("Ula PV – tootmine On", msg + "\nRelee Off – inverter On");
     }
   });
 }
@@ -75,14 +81,15 @@ function checkPrice() {
         print("Tühi vastus Elering API-st");
         return;
       }
-      let price = data.data.ee[0].price;
-      state.last_price = price;
-      print("Nord Pool EE hind:", price, "EUR/MWh");
+      let np_price  = data.data.ee[0].price;
+      let eff_price = np_price - CFG.tasakaalustus_eur_mwh - CFG.marginaal_eur_mwh;
+      state.last_price = eff_price;
+      print("NP:", np_price, "EUR/MWh | Efektiivne:", eff_price, "EUR/MWh");
 
-      if (price < CFG.threshold_eur_mwh) {
-        setRelay(true, price);
+      if (eff_price < CFG.threshold_eur_mwh) {
+        setRelay(true, np_price, eff_price);
       } else {
-        setRelay(false, price);
+        setRelay(false, np_price, eff_price);
       }
     } catch(e) {
       print("JSON viga:", e);
@@ -97,7 +104,7 @@ print("Skript käivitatud. Threshold:", CFG.threshold_eur_mwh, "EUR/MWh");
 Shelly.addStatusHandler(function(e) {
   if (e.component === "switch:0" && e.delta && e.delta.output !== undefined) {
     sendPushover(
-      "Manual ",
+      "Manual",
       "Relee " + (e.delta.output ? "ON" : "OFF")
     );
   }
