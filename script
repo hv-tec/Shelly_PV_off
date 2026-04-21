@@ -3,69 +3,154 @@ Created by Heikki Visnapuu, 2026
 Licensed under the MIT License
 https://github.com/hv-tec/Shelly_PV_off
 
-This Shelly script is designed to retrieve 15 min energy market prices from Elering and
-activate shelly NO relay to cut off solar panels production.
+This Shelly script retrieves 15 min energy market prices from Elering and
+activates shelly NO relay to cut off solar panels production.
+Notifications are sent to registered users via Supabase.
 
-Taastuvenergia toetusega tootjad: jätke tasakaalustus ja marginaal 0-ks (ainult 0-hinna kaitse).
+Taastuvenergia toetusega tootjad: jätke tasakaalustus ja marginaal 0-ks.
 Börsilepinguga tootjad: seadistage tasakaalustus ja marginaal vastavalt lepingule.
 */
 
 let CFG = {
   relay_id: 0,
-  threshold_eur_kwh: 0,          // €/kWh – relee ON kui efektiivne hind langeb alla selle
-  check_interval: 120,           // sekundit
-  api_timeout: 15,               // sekundit
-  tasakaalustus_eur_kwh: 0,      // ← börsilepinguga tootjad: nt 0.00373
-  marginaal_eur_kwh: 0,          // ← börsilepinguga tootjad: nt 0.015
-  pushover_token: "????",        // ← Pushover app token
-  pushover_user:  "????",        // ← Pushover user key
+  threshold_eur_kwh: 0,
+  check_interval: 120,
+  api_timeout: 15,
+  tasakaalustus_eur_kwh: 0,
+  marginaal_eur_kwh: 0,
+  plant_id: "assaku",                    // ← set to your plant: "assaku", "pusku", etc
+  supabase_url: "YOUR_SUPABASE_URL",
+  supabase_key: "YOUR_SUPABASE_KEY"
 };
 
-let state = { relay_on: false, last_price: null };
+let state = { relay_on: false, last_price: null, cutoff_count: 0 };
 
-function sendPushover(title, message) {
-  let body = "token=" + CFG.pushover_token
-           + "&user="    + CFG.pushover_user
-           + "&title="   + title
-           + "&message=" + message
-           + "&priority=1";
-  Shelly.call("HTTP.POST", {
-    url: "https://api.pushover.net/1/messages.json",
-    content_type: "application/x-www-form-urlencoded",
-    body: body,
+function nowISO() {
+  return new Date(Shelly.getComponentStatus("sys").unixtime * 1000).toISOString();
+}
+
+function notifyUsers(np_price, eff_price, relay_on) {
+  let query = CFG.supabase_url + "/rest/v1/users?plant_id=eq." + CFG.plant_id + "&select=phone_number";
+
+  Shelly.call("HTTP.GET", {
+    url: query,
+    headers: {
+      "apikey": CFG.supabase_key,
+      "Authorization": "Bearer " + CFG.supabase_key
+    },
+    ssl_ca: "*",
     timeout: CFG.api_timeout
   }, function(res, err) {
-    if (err) { print("Pushover viga:", err); return; }
-    print("Pushover saadetud, vastus:", res.code);
+    if (err || !res || res.code !== 200) {
+      print("Supabase users query error:", err || (res ? res.code : "no response"));
+      return;
+    }
+    try {
+      let users = JSON.parse(res.body);
+      if (users.length === 0) {
+        print("No users registered for plant:", CFG.plant_id);
+        return;
+      }
+      logCutoffEvent(np_price, eff_price, relay_on);
+      // Stagger notifications to avoid exceeding Shelly's 2 concurrent HTTP limit
+      for (let i = 0; i < users.length; i++) {
+        Timer.set(i * 600, false, sendNotification, {
+          phone: users[i].phone_number,
+          np: np_price,
+          eff: eff_price,
+          on: relay_on
+        });
+      }
+    } catch(e) {
+      print("Parse error:", e);
+    }
+  });
+}
+
+function logCutoffEvent(np_price, eff_price, relay_on) {
+  state.cutoff_count++;
+  let payload = JSON.stringify({
+    plant_id: CFG.plant_id,
+    timestamp: nowISO(),
+    np_price: np_price,
+    eff_price: eff_price,
+    relay_on: relay_on
+  });
+
+  Shelly.call("HTTP.POST", {
+    url: CFG.supabase_url + "/rest/v1/cutoff_events",
+    headers: {
+      "apikey": CFG.supabase_key,
+      "Authorization": "Bearer " + CFG.supabase_key,
+      "Content-Type": "application/json"
+    },
+    body: payload,
+    ssl_ca: "*",
+    timeout: CFG.api_timeout
+  }, function(res, err) {
+    if (err) {
+      print("Supabase cutoff log error:", err);
+      return;
+    }
+    print("Cutoff event logged. relay_on:", relay_on);
+  });
+}
+
+function sendNotification(data) {
+  let status = data.on ? "PV OFF (hind negatiivne)" : "PV ON (hind taastunud)";
+  let message = status + ": NP " + data.np + " €/kWh | Efektiivne " + data.eff + " €/kWh";
+
+  let notifPayload = JSON.stringify({
+    plant_id: CFG.plant_id,
+    phone_number: data.phone,
+    message: message,
+    timestamp: nowISO()
+  });
+
+  Shelly.call("HTTP.POST", {
+    url: CFG.supabase_url + "/rest/v1/notifications",
+    headers: {
+      "apikey": CFG.supabase_key,
+      "Authorization": "Bearer " + CFG.supabase_key,
+      "Content-Type": "application/json"
+    },
+    body: notifPayload,
+    ssl_ca: "*",
+    timeout: CFG.api_timeout
+  }, function(res, err) {
+    if (err) {
+      print("Notification log error for", data.phone, ":", err);
+      return;
+    }
+    print("Notification queued for", data.phone);
   });
 }
 
 function setRelay(on, np_price, eff_price) {
   if (state.relay_on === on) return;
+
   Shelly.call("Switch.Set", { id: CFG.relay_id, on: on }, function(r, e) {
-    if (e) { print("Relay viga:", e); return; }
+    if (e) {
+      print("Relay error:", e);
+      return;
+    }
     state.relay_on = on;
-    let msg = "NP: " + np_price + " €/kWh\n"
-            + "Tasakaalustus: -" + CFG.tasakaalustus_eur_kwh + "\n"
-            + "Marginaal: -" + CFG.marginaal_eur_kwh + "\n"
-            + "Efektiivne: " + eff_price + " €/kWh";
     if (on) {
       print(">>> RELAY ON – PV Off (" + eff_price + " €/kWh)");
-      sendPushover("Ula PV – tootmine peatatud", msg + "\nRelee On – inverter Off");
     } else {
       print("<<< RELAY OFF – PV On (" + eff_price + " €/kWh)");
-      sendPushover("Ula PV – tootmine On", msg + "\nRelee Off – inverter On");
     }
+    notifyUsers(np_price, eff_price, on);
   });
 }
 
 function checkPrice() {
-  let now = Date.now();
-  let periodStart = Math.floor(now / 900000) * 900000;
-  let periodEnd   = periodStart + 900000;
+  let unixtime = Shelly.getComponentStatus("sys").unixtime;
+  let periodStart = Math.floor(unixtime / 900) * 900;
+  let periodEnd = periodStart + 900;
 
-  function toISO(ms) {
-    return new Date(ms).toISOString().split(".")[0] + "Z";
+  function toISO(s) {
+    return new Date(s * 1000).toISOString().split(".")[0] + "Z";
   }
 
   let url = "https://dashboard.elering.ee/api/nps/price"
@@ -73,18 +158,18 @@ function checkPrice() {
           + "&start=" + toISO(periodStart)
           + "&end="   + toISO(periodEnd);
 
-  Shelly.call("HTTP.GET", { url: url, timeout: CFG.api_timeout }, function(res, err) {
+  Shelly.call("HTTP.GET", { url: url, ssl_ca: "*", timeout: CFG.api_timeout }, function(res, err) {
     if (err || !res || res.code !== 200) {
-      print("API viga:", err || (res ? res.code : "no response"));
+      print("Elering API error:", err || (res ? res.code : "no response"));
       return;
     }
     try {
       let data = JSON.parse(res.body);
       if (!data.success || !data.data || !data.data.ee || !data.data.ee.length) {
-        print("Tühi vastus Elering API-st");
+        print("Empty response from Elering API");
         return;
       }
-      // Elering tagastab EUR/MWh → teisendame €/kWh
+      // Elering returns EUR/MWh → convert to €/kWh
       let np_price  = Math.round(data.data.ee[0].price / 10) / 100;
       let eff_price = Math.round((np_price - CFG.tasakaalustus_eur_kwh - CFG.marginaal_eur_kwh) * 10000) / 10000;
       state.last_price = eff_price;
@@ -96,20 +181,17 @@ function checkPrice() {
         setRelay(false, np_price, eff_price);
       }
     } catch(e) {
-      print("JSON viga:", e);
+      print("JSON parse error:", e);
     }
   });
 }
 
 checkPrice();
 Timer.set(CFG.check_interval * 1000, true, checkPrice);
-print("Skript käivitatud. Threshold:", CFG.threshold_eur_kwh, "€/kWh");
+print("Script started. Plant:", CFG.plant_id, "| Threshold:", CFG.threshold_eur_kwh, "€/kWh");
 
 Shelly.addStatusHandler(function(e) {
   if (e.component === "switch:0" && e.delta && e.delta.output !== undefined) {
-    sendPushover(
-      "Manual",
-      "Relee " + (e.delta.output ? "ON" : "OFF")
-    );
+    print("Manual relay switch:", e.delta.output ? "ON" : "OFF");
   }
 });
