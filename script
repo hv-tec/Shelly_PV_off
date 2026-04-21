@@ -6,6 +6,7 @@ https://github.com/hv-tec/Shelly_PV_off
 This Shelly script retrieves 15 min energy market prices from Elering and
 activates shelly NO relay to cut off solar panels production.
 Both ON and OFF events are logged to Supabase and notified via Telegram.
+PV OFF message includes running cutoff count fetched from Supabase.
 
 Taastuvenergia toetusega tootjad: jätke tasakaalustus ja marginaal 0-ks.
 Börsilepinguga tootjad: seadistage tasakaalustus ja marginaal vastavalt lepingule.
@@ -36,10 +37,7 @@ function sendTelegram(message) {
   Shelly.call("HTTP.POST", {
     url: "https://api.telegram.org/bot" + CFG.telegram_token + "/sendMessage",
     content_type: "application/json",
-    body: JSON.stringify({
-      chat_id: CFG.telegram_chat_id,
-      text: message
-    }),
+    body: JSON.stringify({ chat_id: CFG.telegram_chat_id, text: message }),
     ssl_ca: "*",
     timeout: CFG.api_timeout
   }, function(res, err) {
@@ -49,14 +47,6 @@ function sendTelegram(message) {
 }
 
 function logEvent(np_price, eff_price, relay_on) {
-  let payload = JSON.stringify({
-    plant_id: CFG.plant_id,
-    timestamp: nowISO(),
-    np_price: np_price,
-    eff_price: eff_price,
-    relay_on: relay_on
-  });
-
   Shelly.call("HTTP.POST", {
     url: CFG.supabase_url + "/rest/v1/cutoff_events",
     headers: {
@@ -64,7 +54,13 @@ function logEvent(np_price, eff_price, relay_on) {
       "Authorization": "Bearer " + CFG.supabase_key,
       "Content-Type": "application/json"
     },
-    body: payload,
+    body: JSON.stringify({
+      plant_id: CFG.plant_id,
+      timestamp: nowISO(),
+      np_price: np_price,
+      eff_price: eff_price,
+      relay_on: relay_on
+    }),
     ssl_ca: "*",
     timeout: CFG.api_timeout
   }, function(res, err) {
@@ -80,17 +76,40 @@ function setRelay(on, np_price, eff_price) {
     if (e) { print("Relay error:", e); return; }
     state.relay_on = on;
 
-    let msg;
     if (on) {
       print(">>> RELAY ON - PV Off (" + eff_price + " EUR/kWh)");
-      msg = CFG.plant_name + " PV OFF\nNP: " + np_price + " EUR/kWh\nEfektiivne: " + eff_price + " EUR/kWh";
+      // Fetch existing OFF count, then log event + notify with count+1
+      Shelly.call("HTTP.GET", {
+        url: CFG.supabase_url + "/rest/v1/cutoff_events?plant_id=eq." + CFG.plant_id + "&relay_on=eq.true&select=id",
+        headers: {
+          "apikey": CFG.supabase_key,
+          "Authorization": "Bearer " + CFG.supabase_key
+        },
+        ssl_ca: "*",
+        timeout: CFG.api_timeout
+      }, function(res, err) {
+        let count = 0;
+        if (!err && res && res.code === 200) {
+          try { count = JSON.parse(res.body).length; } catch(e) {}
+        }
+        count = count + 1; // include current event
+        logEvent(np_price, eff_price, true);
+        sendTelegram(
+          CFG.plant_name + " PV OFF (#" + count + ")\n" +
+          "NP: " + np_price + " EUR/kWh\n" +
+          "Efektiivne: " + eff_price + " EUR/kWh"
+        );
+      });
+
     } else {
       print("<<< RELAY OFF - PV On (" + eff_price + " EUR/kWh)");
-      msg = CFG.plant_name + " PV ON\nNP: " + np_price + " EUR/kWh\nEfektiivne: " + eff_price + " EUR/kWh";
+      logEvent(np_price, eff_price, false);
+      sendTelegram(
+        CFG.plant_name + " PV ON\n" +
+        "NP: " + np_price + " EUR/kWh\n" +
+        "Efektiivne: " + eff_price + " EUR/kWh"
+      );
     }
-
-    sendTelegram(msg);
-    logEvent(np_price, eff_price, on);
   });
 }
 
